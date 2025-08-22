@@ -406,10 +406,16 @@ function M.new(screen, shm_name)
   return kitty
 end
 
+-- Prefer nvim_ui_send if available (Nvim 0.12) to avoid clashing with the TUI.
+--- @param data string
+local tty_write = api.nvim_ui_send or function(data)
+  io.stderr:write(data)
+end
+
 function M:close()
   if self.has_image then
     -- Delete the image and its virtual placement.
-    io.stderr:write(
+    tty_write(
       self.screen:passthrough_escape(("\27_Gq=2,a=d,d=I,i=%u,p=%u\27\\"):format(
         self.image_id,
         self.image_id -- Placement ID same as image ID for convenience.
@@ -455,7 +461,7 @@ local function handle_detection(kitty)
 
   -- Query is similar to what we'll typically send to the terminal.
   -- Particuarly, we ensure it can read from the shared memory object.
-  io.stderr:write(
+  tty_write(
     kitty.screen:passthrough_escape(
       (
         "\27_Ga=q,t=s,f=24,i=%u,s=%u,v=%u;%s\27\\" -- Image info.
@@ -501,7 +507,7 @@ function M:refresh()
 
   -- Read frame image data (24-bit RGB) from the shared memory object.
   -- Create/re-use and place the virtual placement for it.
-  io.stderr:write(
+  tty_write(
     self.screen:passthrough_escape(
       (
         "\27_Gq=2,a=T,U=1,z=-1,p=%u,c=%u,r=%u," -- Control and placement info.
