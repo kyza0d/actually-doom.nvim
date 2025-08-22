@@ -415,12 +415,16 @@ end
 function M:close()
   if self.has_image then
     -- Delete the image and its virtual placement.
-    tty_write(
-      self.screen:passthrough_escape(("\27_Gq=2,a=d,d=I,i=%u,p=%u\27\\"):format(
-        self.image_id,
-        self.image_id -- Placement ID same as image ID for convenience.
-      ))
-    )
+    vim.schedule(function()
+      tty_write(
+        self.screen:passthrough_escape(
+          ("\27_Gq=2,a=d,d=I,i=%u,p=%u\27\\"):format(
+            self.image_id,
+            self.image_id -- Placement ID same as image ID for convenience.
+          )
+        )
+      )
+    end)
     self.has_image = false
   end
 end
