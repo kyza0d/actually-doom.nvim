@@ -215,7 +215,7 @@ function M:refresh(
   draw_status_bar,
   draw_pause
 )
-  if not self.screen.term_chan then
+  if not self.screen.term_chan or self.screen.closed then
     return
   end
 

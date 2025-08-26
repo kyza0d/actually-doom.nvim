@@ -493,7 +493,9 @@ local function handle_detection(kitty)
 end
 
 function M:refresh()
-  if self.detect then
+  if not self.screen.term_chan or self.screen.closed then
+    return
+  elseif self.detect then
     handle_detection(self)
     return
   end
