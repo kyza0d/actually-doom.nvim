@@ -21,6 +21,8 @@
 
 #include "p_mobj.h"
 
+#define NORM_SEP 128
+
 //
 // Initializes sound stuff, including volume
 // Sets channels, SFX and music volume,

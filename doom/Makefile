@@ -5,7 +5,7 @@
 # Just set $OUTDIR appropriately at the command line when invoking make.
 # You may need to run "make clean" first if an executable already exists there.
 
-CFLAGS += -std=c99 -Wall -Wextra -Wpedantic -g3
+CFLAGS += -std=c99 -Wall -Wextra -Wpedantic -g3 -DFEATURE_SOUND
 
 # Platform-specific flags
 UNAME_S := $(shell uname -s)
@@ -29,7 +29,9 @@ OBJS := am_map.o doomstat.o dstrings.o d_event.o d_items.o d_iwad.o \
         r_draw.o r_main.o r_plane.o r_segs.o r_sky.o r_things.o sha1.o \
         sounds.o statdump.o st_lib.o st_stuff.o s_sound.o tables.o v_video.o \
         wi_stuff.o w_checksum.o w_file.o w_main.o w_wad.o z_zone.o \
-        w_file_stdc.o i_input.o i_video.o doomgeneric.o doomgeneric_actually.o
+        w_file_stdc.o i_input.o i_video.o \
+        miniaudio.o i_doomgeneric_miniaudio.o doomgeneric.o \
+        doomgeneric_actually.o
 
 OBJDIR := $(OUTDIR)/objects
 OBJS := $(addprefix $(OBJDIR)/,$(OBJS))
