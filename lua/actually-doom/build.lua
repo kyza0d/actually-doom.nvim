@@ -101,6 +101,8 @@ local object_names = {
   "w_wad.o",
   "wi_stuff.o",
   "z_zone.o",
+  "miniaudio.o",
+  "i_doomgeneric_miniaudio.o",
   "doomgeneric.o",
   "doomgeneric_actually.o",
 }
@@ -526,6 +528,7 @@ function M.rebuild(opts)
       "-Wextra",
       "-Wpedantic",
       "-DNDEBUG",
+      "-DFEATURE_SOUND",
       "-O3",
       -- Optimizations are on, but some debug info is useful, just in case.
       "-g",

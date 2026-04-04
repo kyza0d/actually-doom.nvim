@@ -27,6 +27,10 @@ COMMANDS					*actually-doom-commands*
 			DOOM is started regardless of whether one is already
 			running.
 
+			Sound effect playback is supported via miniaudio
+			(https://miniaud.io/).  Music playback is not yet
+			implemented.
+
 ==============================================================================
 GAME CONTROLS				*actually-doom-game-controls*
 

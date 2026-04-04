@@ -18,10 +18,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#if defined(FEATURE_SOUND)
-#include <SDL_mixer.h>
-#endif
-
 #include "config.h"
 #include "doomtype.h"
 #include "i_sound.h"
@@ -119,7 +115,7 @@ static void InitMusicModule(void)
 {
 #ifdef FEATURE_SOUND
     music_module = &DG_music_module;
-#endif /* FEATURE_SOUND */
+#endif
 }
 
 //
@@ -337,16 +333,4 @@ void I_BindSoundVariables(void)
     M_BindVariable("snd_musiccmd", &snd_musiccmd);
     M_BindVariable("snd_samplerate", &snd_samplerate);
     M_BindVariable("snd_cachesize", &snd_cachesize);
-
-#ifdef FEATURE_SOUND
-    extern int use_libsamplerate;
-    extern float libsamplerate_scale;
-
-    M_BindVariable("use_libsamplerate", &use_libsamplerate);
-    M_BindVariable("libsamplerate_scale", &libsamplerate_scale);
-#endif
-
-    // Before SDL_mixer version 1.2.11, MIDI music caused the game
-    // to crash when it looped.  If this is an old SDL_mixer version,
-    // disable MIDI.
 }

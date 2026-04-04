@@ -25,6 +25,9 @@ Install it via your favourite package manager like any other plugin, then run
 The [shareware version](https://www.doomworld.com/classicdoom/info/shareware.php)
 of DOOM is included for your convenience.
 
+Sound effect playback is supported via [miniaudio](https://miniaud.io/). Music
+playback is not yet implemented.
+
 For more information regarding controls and such, consult
 `:help actually-doom.txt`.
 
