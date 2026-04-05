@@ -4,6 +4,7 @@
 #include <libgen.h>
 #include <limits.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -143,6 +144,9 @@ static volatile sig_atomic_t interrupted;
 static uint32_t clock_start_ms;
 static byte enabled_dui_types;
 static boolean comm_writing_msg;
+static FILE *child_log_file;
+static char child_log_path[PATH_MAX + 1];
+static time_t child_log_last_heartbeat;
 
 #define COMM_WRITE_MSG(block)      \
     do {                           \
@@ -184,6 +188,88 @@ static void SigintHandler(int signum)
     // Generally try to handle SIGINTs with a graceful shutdown, but it may be
     // possible that DOOM code triggers syscalls without handling EINTR nicely..
     interrupted = true;
+}
+
+static void ChildLog(const char *fmt, ...)
+{
+    if (!child_log_file)
+        return;
+
+    time_t now = time(NULL);
+    struct tm now_tm;
+    if (localtime_r(&now, &now_tm) != NULL) {
+        fprintf(child_log_file,
+                "%04d-%02d-%02d %02d:%02d:%02d [doom-child] ",
+                now_tm.tm_year + 1900, now_tm.tm_mon + 1, now_tm.tm_mday,
+                now_tm.tm_hour, now_tm.tm_min, now_tm.tm_sec);
+    } else {
+        fprintf(child_log_file, "time=? [doom-child] ");
+    }
+
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(child_log_file, fmt, ap);
+    va_end(ap);
+    fputc('\n', child_log_file);
+    fflush(child_log_file);
+}
+
+static void ChildLog_Init(void)
+{
+    const char *cache_home = getenv("XDG_CACHE_HOME");
+    char cache_home_buf[PATH_MAX + 1];
+    if (!cache_home || cache_home[0] == '\0') {
+        const char *home = getenv("HOME");
+        if (!home || home[0] == '\0')
+            return;
+        if (snprintf(cache_home_buf, sizeof cache_home_buf, "%s/.cache", home)
+            >= (int)sizeof cache_home_buf) {
+            return;
+        }
+        cache_home = cache_home_buf;
+    }
+
+    // Directory may already exist.
+    if (mkdir(cache_home, 0700) == -1 && errno != EEXIST)
+        return;
+
+    char log_dir[PATH_MAX + 1];
+    if (snprintf(log_dir, sizeof log_dir, "%s/actually-doom.nvim", cache_home)
+            >= (int)sizeof log_dir) {
+        return;
+    }
+    if (mkdir(log_dir, 0700) == -1 && errno != EEXIST)
+        return;
+
+    time_t now = time(NULL);
+    if (snprintf(child_log_path, sizeof child_log_path,
+                 "%s/doom-child-%jd-%jd.log", log_dir, (intmax_t)getpid(),
+                 (intmax_t)now)
+        >= (int)sizeof child_log_path) {
+        return;
+    }
+
+    child_log_file = fopen(child_log_path, "a");
+    if (!child_log_file)
+        return;
+
+    setvbuf(child_log_file, NULL, _IONBF, 0);
+    ChildLog("log opened; pid=%jd ppid=%jd",
+             (intmax_t)getpid(), (intmax_t)getppid());
+}
+
+static void ChildLog_MaybeHeartbeat(void)
+{
+    if (!child_log_file)
+        return;
+
+    time_t now = time(NULL);
+    if (child_log_last_heartbeat != 0 && now - child_log_last_heartbeat < 2)
+        return;
+    child_log_last_heartbeat = now;
+
+    ChildLog("heartbeat ppid=%jd comm_sock_fd=%d gamestate=%d",
+             (intmax_t)getppid(), comm_sock_fd, (int)gamestate);
 }
 
 static boolean Ring_IsEmpty(const ringbuf_t *r)
@@ -283,6 +369,8 @@ static void Comm_FlushSend(boolean closing)
                         LOG_PRE "Communications connection was closed; "
                                 "quitting: %s\n",
                         strerror(errno));
+                ChildLog("send failed (connection closed): errno=%d (%s)",
+                         errno, strerror(errno));
                 I_Quit(); // noreturn
                 abort();
 
@@ -599,6 +687,7 @@ static void Comm_Receive(void)
             fprintf(stderr,
                     LOG_PRE "EOF while reading from communications socket; "
                             "quitting\n");
+            ChildLog("recv EOF on communications socket");
             I_Quit();
         } else if (recv_ret < 0) {
             switch (errno) {
@@ -614,6 +703,7 @@ static void Comm_Receive(void)
                 continue;
             }
 
+            ChildLog("recv failed: errno=%d (%s)", errno, strerror(errno));
             I_Error(LOG_PRE "Unexpected error while reading from "
                             "communications socket: %s",
                     strerror(errno));
@@ -642,6 +732,8 @@ int main(int argc, char **argv)
     // in other applications (like Nvim) may look confusing.
     setvbuf(stdout, NULL, _IOLBF, 0); // Line buffering for stdout.
     setvbuf(stderr, NULL, _IONBF, 0); // No buffering for stderr.
+    ChildLog_Init();
+    ChildLog("main entered (argc=%d)", argc);
 
     struct sigaction sa = {.sa_handler = SigintHandler};
     if (sigemptyset(&sa.sa_mask) == -1 || sigaction(SIGINT, &sa, NULL) == -1) {
@@ -652,6 +744,7 @@ int main(int argc, char **argv)
 
     doomgeneric_Create(argc, argv);
     while (true) {
+        ChildLog_MaybeHeartbeat();
         if (gamestate == GS_LEVEL)
             MaybeSendPlayerStatus();
 
@@ -666,6 +759,7 @@ void DG_WipeTick(void)
     // Screen wipes loop within D_Display, which means we should probably limit
     // this function to simple actions and defer messages that may change game
     // state and such.
+    ChildLog_MaybeHeartbeat();
     Comm_FlushSend(false);
     Comm_Receive();
 }
@@ -721,6 +815,8 @@ static void CloseListenSocket(void)
 
 static void Cleanup(void)
 {
+    ChildLog("cleanup begin (comm_sock_fd=%d listen_sock_fd=%d)", comm_sock_fd,
+             listen_sock_fd);
     CloseListenSocket();
 
     if (comm_sock_fd >= 0) {
@@ -739,6 +835,12 @@ static void Cleanup(void)
 
     CloseFrameShm();
     UnlinkFrameShm();
+
+    ChildLog("cleanup complete");
+    if (child_log_file) {
+        fclose(child_log_file);
+        child_log_file = NULL;
+    }
 }
 
 static uint32_t GetClockMs(void)
@@ -767,6 +869,7 @@ void DG_Init(void)
         I_Error(LOG_PRE "\"-listen <socket_path>\" argument required");
 
     const char *sock_path = myargv[p + 1];
+    ChildLog("DG_Init start; listen socket path=%s", sock_path);
 
     // Max size of sun_path is typically less than the maximal path size; work
     // around this by using chdir and a path relative to the socket's directory.
@@ -849,6 +952,7 @@ void DG_Init(void)
 
     printf(LOG_PRE "Listening for connections on socket \"%s\"...\n",
            sock_path);
+    ChildLog("listening for connection on %s", sock_path);
 
 #ifdef __linux__
     // Linux can set CLOEXEC atomically.
@@ -889,8 +993,10 @@ void DG_Init(void)
                    &(socklen_t){sizeof creds})
         == 0) {
         printf(LOG_PRE "PID %jd has connected\n", (intmax_t)creds.pid);
+        ChildLog("client connected: peer pid=%jd", (intmax_t)creds.pid);
     } else {
         printf(LOG_PRE "A client has connected\n");
+        ChildLog("client connected: peer pid unknown (getsockopt failed)");
     }
 #elif defined(__APPLE__)
     pid_t peer_pid = 0;
@@ -899,11 +1005,14 @@ void DG_Init(void)
                    &peer_pid_len)
         == 0) {
         printf(LOG_PRE "PID %jd has connected\n", (intmax_t)peer_pid);
+        ChildLog("client connected: peer pid=%jd", (intmax_t)peer_pid);
     } else {
         printf(LOG_PRE "A client has connected\n");
+        ChildLog("client connected: peer pid unknown (getsockopt failed)");
     }
 #else
     printf(LOG_PRE "A client has connected\n");
+    ChildLog("client connected: peer pid unknown");
 #endif
 
     CloseListenSocket();
