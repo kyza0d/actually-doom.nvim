@@ -6,6 +6,7 @@ local log = vim.log
 local ui = vim.ui
 local uv = vim.uv
 
+local logger = require "actually-doom.logger"
 local strbuf = require "actually-doom.strbuf"
 
 local M = {
@@ -71,6 +72,7 @@ local M = {
 --- @field sock uv.uv_pipe_t
 --- @field send_buf StrBuf
 --- @field check_timer uv.uv_timer_t
+--- @field debug_timer uv.uv_timer_t
 --- @field check_scheduled boolean?
 --- @field pressed_key PressedKey?
 --- @field mouse_button_mask integer
@@ -449,7 +451,7 @@ function Doom:flush_send()
         ("Failed to send %d byte(s); quitting: %s\n"):format(#data, err),
         "Error"
       )
-      self:close()
+      self:close(("socket write error: %s"):format(err))
     end
   end
   local _, err = self.sock:write(data, handle_err)
@@ -481,6 +483,7 @@ local function init_process(doom, exe_path, sock_path)
     doom.play_opts.iwad_path,
   }
   vim.list_extend(cmd, doom.play_opts.extra_args or {})
+  doom.console:plugin_print(("Spawning DOOM: %s\n"):format(vim.inspect(cmd)), "Debug")
 
   local sys_ok, sys_rv = pcall(vim.system, cmd, {
     cwd = fs.dirname(exe_path),
@@ -492,13 +495,14 @@ local function init_process(doom, exe_path, sock_path)
       ("DOOM (PID %d) exited with code %d\n"):format(doom.process.pid, out.code),
       out.code ~= 0 and "Error" or nil
     )
-    doom:close()
+    doom:close(("process exit callback (code=%d)"):format(out.code))
   end)
 
   if not sys_ok then
     error(("Failed to run DOOM: %s"):format(sys_rv), 0)
   end
   doom.process = sys_rv
+  logger.log("process", ("spawned DOOM pid=%d"):format(sys_rv.pid))
 
   doom.console:plugin_print(
     ("DOOM started as PID %d\n"):format(sys_rv.pid)
@@ -811,7 +815,7 @@ local function recv_msg_loop(doom, buf)
     -- AMSG_QUIT
     [2] = function()
       doom.console:plugin_print "DOOM process disconnected; quitting\n"
-      doom:close()
+      doom:close "received AMSG_QUIT"
       return true -- Quit receive loop.
     end,
   }
@@ -828,7 +832,7 @@ local function recv_msg_loop(doom, buf)
         ("Received unknown message type: %d; quitting\n"):format(msg_type),
         "Error"
       )
-      doom:close()
+      doom:close(("received unknown message type %d"):format(msg_type))
       return
     end
   end
@@ -860,7 +864,7 @@ local function init_connection(doom, sock_path)
           "No connection attempts remaining; giving up\n",
           "Error"
         )
-        doom:close()
+        doom:close "connection retries exhausted"
         return
       end
 
@@ -869,6 +873,10 @@ local function init_connection(doom, sock_path)
     end
 
     doom.console:plugin_print "Connected to the DOOM process\n"
+    doom.console:plugin_print(
+      ("Socket connection established (path=%q)\n"):format(sock_path),
+      "Debug"
+    )
     local recv_buf = strbuf.new(256)
     local recv_co = coroutine.create(recv_msg_loop)
     -- Pass the initial arguments.
@@ -882,9 +890,10 @@ local function init_connection(doom, sock_path)
           ("Read error; quitting: %s\n"):format(read_err),
           "Error"
         )
-        doom:close()
+        doom:close(("socket read error: %s"):format(read_err))
         return
       elseif not data then
+        doom.console:plugin_print("Socket EOF received\n", "Debug")
         return -- No error, but reached EOF.
       end
 
@@ -918,7 +927,7 @@ local function init_connection(doom, sock_path)
           ),
           "Error"
         )
-        doom:close()
+        doom:close(("failed to chdir to socket dir %q"):format(sock_dir_path))
         return
       end
 
@@ -943,7 +952,7 @@ local function init_connection(doom, sock_path)
           ):format(old_cwd, chdir_err),
           "Error"
         )
-        doom:close()
+        doom:close(("failed to restore cwd %q"):format(old_cwd))
         return
       end
 
@@ -966,19 +975,52 @@ function Doom.run(console, exe_path, opts)
     console = console,
     play_opts = opts,
     check_timer = assert(uv.new_timer()),
+    debug_timer = assert(uv.new_timer()),
     send_buf = strbuf.new(256),
     mouse_button_mask = 0,
     game_msg = "",
     menu_msg = "",
     automap_title = "",
   }, { __index = Doom })
+  logger.log("game", "Doom.run() started")
+  logger.log(
+    "env",
+    ("TMUX=%q TMUX_PANE=%q TERM=%q NVIM=%q"):format(
+      tostring(vim.env.TMUX),
+      tostring(vim.env.TMUX_PANE),
+      tostring(vim.env.TERM),
+      tostring(vim.env.NVIM)
+    )
+  )
+  local log_path = logger.path()
+  if log_path then
+    doom.console:plugin_print(("Persistent log file: %s\n"):format(log_path), "Debug")
+  end
+  assert(doom.debug_timer:start(2000, 2000, function()
+    if doom.closed then
+      return
+    end
+    local sock_state = "nil"
+    if doom.sock then
+      sock_state = doom.sock:is_closing() and "closing" or "open"
+    end
+    logger.log(
+      "heartbeat",
+      ("nvim_pid=%d doom_pid=%s sock=%s screen=%s"):format(
+        uv.os_getpid(),
+        doom.process and tostring(doom.process.pid) or "nil",
+        sock_state,
+        doom.screen and (doom.screen.closed and "closed" or "open") or "nil"
+      )
+    )
+  end))
 
   -- Less verbose Doom.close_on_err and doesn't include a stack trace.
   local function close_on_err_quieter(...)
     local ok, rv = pcall(...)
     if not ok then
       doom.console:plugin_print(rv, "Error")
-      doom:close()
+      doom:close "initialization error"
       error(rv, 0)
     end
     return rv
@@ -998,21 +1040,41 @@ function Doom.run(console, exe_path, opts)
   return doom
 end
 
-function Doom:close()
+function Doom:close(reason)
   if self.closed then
+    logger.log("game", "Doom:close() ignored; already closed")
     return
   end
   self.closed = true
+  logger.log(
+    "game",
+    ("Doom:close() reason=%s pid=%s"):format(
+      reason or "unspecified",
+      self.process and tostring(self.process.pid) or "nil"
+    )
+  )
+  if self.console then
+    self.console:plugin_print(
+      ("Closing DOOM instance (reason: %s)\n"):format(reason or "unspecified"),
+      "Debug"
+    )
+  end
 
   -- Non-nil fields may be nil if we're called during initialization.
   if self.check_timer then
     self.check_timer:stop()
     self.check_timer:close()
   end
+  if self.debug_timer then
+    self.debug_timer:stop()
+    self.debug_timer:close()
+  end
   if self.sock then
+    logger.log("game", "Closing socket handle")
     self.sock:close() -- Also closes pending requests and such.
   end
   if self.process then
+    logger.log("game", ("Sending SIGTERM to pid=%d"):format(self.process.pid))
     self.process:kill "sigterm" -- Try a clean shutdown.
   end
   -- Close console before the screen so it doesn't print the "buffer was
@@ -1061,7 +1123,7 @@ function Doom:close_on_err(f, ...)
         ("Quitting after unexpected error: %s\n"):format(nrvs_or_err),
         "Error"
       )
-      self:close()
+      self:close "unexpected Lua error"
     end)
     error(nrvs_or_err, 0) -- The double traceback is unfortunate.
   end

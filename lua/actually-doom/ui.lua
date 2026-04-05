@@ -2,6 +2,7 @@ local api = vim.api
 local fn = vim.fn
 local log = vim.log
 
+local logger = require "actually-doom.logger"
 local strbuf = require "actually-doom.strbuf"
 
 local M = {
@@ -120,6 +121,20 @@ api.nvim_create_autocmd("WinLeave", {
   desc = "[actually-doom.nvim] Close floating screen window when leaving",
 })
 
+api.nvim_create_autocmd({ "VimLeavePre", "VimLeave" }, {
+  group = augroup,
+  callback = function(args)
+    logger.log(
+      "nvim",
+      ("%s (tracked_screens=%d)"):format(
+        args.event,
+        vim.tbl_count(M.screen_buf_to_doom)
+      )
+    )
+  end,
+  desc = "[actually-doom.nvim] Debug lifecycle markers",
+})
+
 --- @param width integer?
 --- @param height integer?
 --- @return vim.api.keyset.win_config
@@ -219,6 +234,12 @@ api.nvim_create_autocmd("WinClosed", {
       if doom.closed or fn.bufwinnr(buf) ~= -1 then
         return
       end
+      doom.console:plugin_print(
+        ("Screen window closed but process still alive (screen_buf=%d)\n"):format(
+          buf
+        ),
+        "Debug"
+      )
       -- Pretty clear it's from this plugin, so don't bother with the
       -- "[actually-doom.nvim]" prefix; helps avoid hit-ENTER anyway.
       vim.notify(
@@ -294,12 +315,15 @@ function Console.new()
   api.nvim_set_option_value("modifiable", false, { buf = console.buf })
   api.nvim_command(("tab %d sbuffer"):format(console.buf))
   update_console_buf_name(console)
+  logger.log("ui", ("Console.new(buf=%d)"):format(console.buf))
   return console
 end
 
 function Console:close()
+  logger.log("ui", ("Console:close(buf=%d)"):format(self.buf))
   if self.close_autocmd then
     api.nvim_del_autocmd(self.close_autocmd)
+    self.close_autocmd = nil
   end
 end
 
@@ -339,6 +363,7 @@ function Console:print(text, console_hl)
     end)
     return
   end
+  logger.log(("console:%s"):format(console_hl or "Info"), text)
   if not api.nvim_buf_is_loaded(self.buf) then
     return
   end
@@ -470,6 +495,10 @@ function Screen.new(doom, res_x, res_y)
     res_y = res_y,
     gfx = NullGfx,
   }, { __index = Screen })
+  logger.log(
+    "ui",
+    ("Screen.new(res=%dx%d, pid=%d)"):format(res_x, res_y, doom.process.pid)
+  )
 
   if doom.play_opts.tmux_passthrough == nil and os.getenv "TMUX" then
     doom.console:plugin_print("$TMUX set, enabling tmux passthrough\n", "Debug")
@@ -529,6 +558,7 @@ end
 
 function Screen:close()
   self.closed = true
+  logger.log("ui", "Screen:close()")
   self.gfx:close()
 
   if self.buf then
