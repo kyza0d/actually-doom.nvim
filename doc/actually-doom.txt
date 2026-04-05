@@ -120,6 +120,19 @@ environment variable is set, but it can be toggled manually by pressing CTRL-T
 in-game.  See |actually-doom-persist-kitty-tmux| for how to persist this
 setting.
 
+==============================================================================
+DEBUG LOGS					*actually-doom-debug-logs*
+
+actually-doom.nvim writes runtime logs to:
+	`~/.cache/actually-doom.nvim/`
+
+Each run gets a new session log file named like:
+	`session-YYYYmmdd-HHMMSS-<pid>-<ms>.log`
+
+These logs include plugin lifecycle events (startup, socket connection and read
+errors, close reasons, buffer-unload teardown paths), along with DOOM process
+stdout/stderr output.
+
 
 					*actually-doom-persist-kitty-tmux*
 Your preferences for these settings can be saved by calling

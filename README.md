@@ -74,6 +74,18 @@ for this.
 
 Press `<C-\><C-N>`.
 
+### Where are debug logs stored?
+
+Runtime logs are saved to `~/.cache/actually-doom.nvim/` in per-session files
+named like `session-YYYYmmdd-HHMMSS-<pid>-<ms>.log`.
+
+These logs include plugin lifecycle events (startup, socket connect/read
+errors, close reasons, buffer-unload teardown) and the DOOM process
+stdout/stderr stream.
+When available, the DOOM child process also writes independent logs named
+`doom-child-<pid>-<epoch>.log`, which can capture orphan behavior after Nvim
+has already exited.
+
 ### Why does the graphics and performance suck?
 
 You're likely using the fallback renderer that blasts-out a bunch of escape
