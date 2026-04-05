@@ -462,6 +462,23 @@ end
 --- @param exe_path string
 --- @param sock_path string
 local function init_process(doom, exe_path, sock_path)
+  --- @param tag string
+  --- @param pid integer
+  local function log_pid_state(tag, pid)
+    local pid_status, pid_err_msg, pid_err = uv.kill(pid, 0)
+    local alive = pid_status == 0
+    logger.log(
+      "process",
+      ("PROC_PID_STATE tag=%s pid=%d alive=%s err=%s err_msg=%s"):format(
+        tag,
+        pid,
+        tostring(alive),
+        tostring(pid_err),
+        tostring(pid_err_msg)
+      )
+    )
+  end
+
   --- @param console_hl string?
   --- @return fun(err: nil|string, data: string|nil)
   --- @nodiscard
@@ -490,7 +507,25 @@ local function init_process(doom, exe_path, sock_path)
     stdout = new_out_cb(),
     stderr = new_out_cb "Warn",
   }, function(out)
+    local pid = doom.process and doom.process.pid
     doom.console:print "\n"
+    logger.log(
+      "process",
+      ("PROC_EXIT pid=%s code=%s signal=%s"):format(
+        pid and tostring(pid) or "nil",
+        tostring(out.code),
+        tostring(out.signal)
+      )
+    )
+    if pid then
+      log_pid_state("exit_cb_immediate", pid)
+      vim.defer_fn(function()
+        log_pid_state("exit_cb_plus_100ms", pid)
+      end, 100)
+      vim.defer_fn(function()
+        log_pid_state("exit_cb_plus_1000ms", pid)
+      end, 1000)
+    end
     doom.console:plugin_print(
       ("DOOM (PID %d) exited with code %d\n"):format(doom.process.pid, out.code),
       out.code ~= 0 and "Error" or nil
@@ -814,6 +849,12 @@ local function recv_msg_loop(doom, buf)
 
     -- AMSG_QUIT
     [2] = function()
+      logger.log(
+        "socket",
+        ("AMSG_QUIT_RECEIVED pid=%s"):format(
+          doom.process and tostring(doom.process.pid) or "nil"
+        )
+      )
       doom.console:plugin_print "DOOM process disconnected; quitting\n"
       doom:close "received AMSG_QUIT"
       return true -- Quit receive loop.
@@ -1075,7 +1116,26 @@ function Doom:close(reason)
   end
   if self.process then
     logger.log("game", ("Sending SIGTERM to pid=%d"):format(self.process.pid))
-    self.process:kill "sigterm" -- Try a clean shutdown.
+    local ok, kill_err = pcall(self.process.kill, self.process, "sigterm")
+    if ok then
+      local msg = ("PARENT_KILL_RESULT ok pid=%d signal=sigterm"):format(self.process.pid)
+      logger.log("game", msg)
+      if self.console then
+        self.console:plugin_print(msg .. "\n", "Debug")
+      end
+    else
+      local err_msg = tostring(kill_err)
+      local reason = err_msg:match("(%u%u%u%u%u)") or "UNKNOWN"
+      local msg = ("PARENT_KILL_RESULT fail pid=%d signal=sigterm reason=%s err=%s"):format(
+        self.process.pid,
+        reason,
+        err_msg
+      )
+      logger.log("game", msg)
+      if self.console then
+        self.console:plugin_print(msg .. "\n", "Error")
+      end
+    end
   end
   -- Close console before the screen so it doesn't print the "buffer was
   -- unloaded" message from us closing the screen.
