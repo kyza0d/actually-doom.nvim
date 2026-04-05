@@ -798,10 +798,20 @@ void DG_Init(void)
                     sock_basename_len);
         }
 
-        if ((listen_sock_fd = socket(AF_UNIX, SOCK_STREAM, 0)) == -1) {
+        if ((listen_sock_fd = socket(AF_UNIX, SOCK_STREAM
+#ifdef __linux__
+                        | SOCK_CLOEXEC // Linux can set this atomically.
+#endif
+                        , 0)) == -1) {
             I_Error(LOG_PRE "Failed to create listener socket: %s",
                     strerror(errno));
         }
+#ifndef __linux__
+        if (fcntl(listen_sock_fd, F_SETFD, FD_CLOEXEC) == -1) {
+            I_Error(LOG_PRE "Failed to set CLOEXEC for listener socket: %s",
+                    strerror(errno));
+        }
+#endif
 
         I_AtExit(Cleanup, true);
         if (chdir(sock_dirname) == -1) {
@@ -840,7 +850,13 @@ void DG_Init(void)
     printf(LOG_PRE "Listening for connections on socket \"%s\"...\n",
            sock_path);
 
+#ifdef __linux__
+    // Linux can set CLOEXEC atomically.
+    while ((comm_sock_fd = accept4(listen_sock_fd, NULL, NULL, SOCK_CLOEXEC))
+            == -1) {
+#else
     while ((comm_sock_fd = accept(listen_sock_fd, NULL, NULL)) == -1) {
+#endif
         switch (errno) {
         case ECONNABORTED:
         case EPERM:
@@ -860,6 +876,12 @@ void DG_Init(void)
                     strerror(errno));
         }
     }
+#ifndef __linux__
+    if (fcntl(comm_sock_fd, F_SETFD, FD_CLOEXEC) == -1) {
+        I_Error(LOG_PRE "Failed to set CLOEXEC for communications socket: %s",
+                strerror(errno));
+    }
+#endif
 
 #ifdef __linux__
     struct ucred creds;
