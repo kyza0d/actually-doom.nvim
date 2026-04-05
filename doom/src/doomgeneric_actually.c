@@ -8,12 +8,18 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/poll.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/uio.h>
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
+
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 
 #ifdef __APPLE__
 #include <sys/ucred.h>
@@ -143,6 +149,8 @@ static volatile sig_atomic_t interrupted;
 static uint32_t clock_start_ms;
 static byte enabled_dui_types;
 static boolean comm_writing_msg;
+static pid_t watch_pid;
+static int watch_pidfd = -1;
 
 #define COMM_WRITE_MSG(block)      \
     do {                           \
@@ -184,6 +192,82 @@ static void SigintHandler(int signum)
     // Generally try to handle SIGINTs with a graceful shutdown, but it may be
     // possible that DOOM code triggers syscalls without handling EINTR nicely..
     interrupted = true;
+}
+
+static void MaybeEnableParentDeathSignal(void) {
+#ifdef __linux__
+    pid_t parent_pid = getppid();
+
+    if (prctl(PR_SET_PDEATHSIG, SIGKILL) == -1)
+    {
+        fprintf(stderr, LOG_PRE "Warning: Failed parent death signal: %s\n", strerror(errno));
+        return;
+    }
+
+    // Guard against a race: if parent already died before prctl, kill self.
+    if (getppid() != parent_pid) kill(getpid(), SIGKILL);
+#endif
+}
+
+static void WatchPid_Init(int argc, char **argv)
+{
+    for (int i = 1; i + 1 < argc; ++i)
+    {
+        if (strcmp(argv[i], "-watch-pid") != 0)
+            continue;
+
+        const char *arg = argv[i + 1];
+        char *end;
+        long pid = strtol(arg, &end, 10);
+
+        if (*arg == '\0' || *end != '\0' || pid <= 0 || pid > INT_MAX)
+        {
+            fprintf(stderr, LOG_PRE "Warning: Invalid watch PID \"%s\"\n", arg);
+            continue;
+        }
+
+        watch_pid = (pid_t)pid;
+
+#if defined(__linux__) && defined(SYS_pidfd_open)
+        watch_pidfd = syscall(SYS_pidfd_open, watch_pid, 0);
+        if (watch_pidfd == -1 && errno != ENOSYS && errno != EINVAL && errno != ESRCH)
+            fprintf(stderr, LOG_PRE "Warning: pidfd open failed: %s\n", strerror(errno));
+#endif
+        return;
+    }
+}
+
+static boolean WatchPid_IsAlive(void)
+{
+    if (watch_pidfd >= 0)
+    {
+        struct pollfd pfd = { .fd = watch_pidfd, .events = POLLIN };
+        int ret;
+
+        while ((ret = poll(&pfd, 1, 0)) == -1)
+        {
+            if (errno == EINTR)
+            {
+                if (interrupted) I_Quit();
+                continue;
+            }
+            fprintf(stderr, LOG_PRE "Warning: poll failed: %s\n", strerror(errno));
+            return true;
+        }
+
+        return ret == 0;
+    }
+
+    return watch_pid != 0 && (kill(watch_pid, 0) == 0 || errno == EPERM);
+}
+
+static void WatchPid_Check(void)
+{
+    if (watch_pid != 0 && !WatchPid_IsAlive())
+    {
+        fprintf(stderr, LOG_PRE "Watched PID %jd exited; quitting\n", (intmax_t)watch_pid);
+        kill(getpid(), SIGKILL);
+    }
 }
 
 static boolean Ring_IsEmpty(const ringbuf_t *r)
@@ -642,6 +726,8 @@ int main(int argc, char **argv)
     // in other applications (like Nvim) may look confusing.
     setvbuf(stdout, NULL, _IOLBF, 0); // Line buffering for stdout.
     setvbuf(stderr, NULL, _IONBF, 0); // No buffering for stderr.
+    WatchPid_Init(argc, argv);
+    MaybeEnableParentDeathSignal();
 
     struct sigaction sa = {.sa_handler = SigintHandler};
     if (sigemptyset(&sa.sa_mask) == -1 || sigaction(SIGINT, &sa, NULL) == -1) {
@@ -652,6 +738,7 @@ int main(int argc, char **argv)
 
     doomgeneric_Create(argc, argv);
     while (true) {
+        WatchPid_Check();
         if (gamestate == GS_LEVEL)
             MaybeSendPlayerStatus();
 
@@ -666,6 +753,7 @@ void DG_WipeTick(void)
     // Screen wipes loop within D_Display, which means we should probably limit
     // this function to simple actions and defer messages that may change game
     // state and such.
+    WatchPid_Check();
     Comm_FlushSend(false);
     Comm_Receive();
 }

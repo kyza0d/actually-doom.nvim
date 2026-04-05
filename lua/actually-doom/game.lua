@@ -460,6 +460,31 @@ end
 --- @param exe_path string
 --- @param sock_path string
 local function init_process(doom, exe_path, sock_path)
+  --- @return integer?
+  --- @nodiscard
+  local function get_tmux_client_pid()
+    if not os.getenv "TMUX" then
+      return nil
+    end
+
+    local ok, proc = pcall(vim.system, {
+      "tmux",
+      "display-message",
+      "-p",
+      "#{client_pid}",
+    }, { text = true })
+    if not ok then
+      return nil
+    end
+
+    local out = proc:wait()
+    if out.code ~= 0 then
+      return nil
+    end
+
+    return tonumber(vim.trim(out.stdout or ""))
+  end
+
   --- @param console_hl string?
   --- @return fun(err: nil|string, data: string|nil)
   --- @nodiscard
@@ -480,6 +505,13 @@ local function init_process(doom, exe_path, sock_path)
     "-iwad",
     doom.play_opts.iwad_path,
   }
+  local tmux_client_pid = get_tmux_client_pid()
+  if tmux_client_pid then
+    vim.list_extend(cmd, {
+      "-watch-pid",
+      tostring(tmux_client_pid),
+    })
+  end
   vim.list_extend(cmd, doom.play_opts.extra_args or {})
 
   local sys_ok, sys_rv = pcall(vim.system, cmd, {

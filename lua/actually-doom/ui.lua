@@ -313,16 +313,17 @@ function Console:set_doom(doom)
   self.close_autocmd = api.nvim_create_autocmd("BufUnload", {
     group = augroup,
     nested = true,
-    callback = vim.schedule_wrap(function(args)
+    -- Keep this synchronous: scheduled callbacks may never run during teardown,
+    -- which can leave the DOOM child process orphaned.
+    callback = function(args)
       if
         args.buf == doom.console.buf
         or (doom.screen and args.buf == doom.screen.buf)
       then
-        doom.console:plugin_print "Game buffer was unloaded; quitting\n"
         doom:close()
         return true -- Delete this autocmd (close should've done that anyway)
       end
-    end),
+    end,
     desc = "[actually-doom.nvim] Quit game when buffers are unloaded",
   })
 end
