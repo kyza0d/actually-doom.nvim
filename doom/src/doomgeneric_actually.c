@@ -147,6 +147,16 @@ static boolean comm_writing_msg;
 static FILE *child_log_file;
 static char child_log_path[PATH_MAX + 1];
 static time_t child_log_last_heartbeat;
+static pid_t expected_parent_pid;
+static pid_t child_log_last_ppid;
+static volatile sig_atomic_t sigterm_received;
+static boolean sigterm_logged;
+static int child_log_last_expected_parent_alive = -1;
+static int child_log_last_expected_parent_same_instance = -1;
+static boolean expected_parent_reuse_logged;
+#ifdef __linux__
+static unsigned long long expected_parent_start_ticks;
+#endif
 
 #define COMM_WRITE_MSG(block)      \
     do {                           \
@@ -184,10 +194,11 @@ typedef struct {
 
 static void SigintHandler(int signum)
 {
-    (void)signum;
     // Generally try to handle SIGINTs with a graceful shutdown, but it may be
     // possible that DOOM code triggers syscalls without handling EINTR nicely..
     interrupted = true;
+    if (signum == SIGTERM)
+        sigterm_received = true;
 }
 
 static void ChildLog(const char *fmt, ...)
@@ -258,18 +269,196 @@ static void ChildLog_Init(void)
              (intmax_t)getpid(), (intmax_t)getppid());
 }
 
+static void ChildLog_MaybeSigterm(void)
+{
+    if (!sigterm_received || sigterm_logged || !child_log_file)
+        return;
+
+    sigterm_logged = true;
+    ChildLog("SIGTERM_RECEIVED pid=%jd ppid=%jd expected_parent=%jd comm_sock_fd=%d",
+             (intmax_t)getpid(), (intmax_t)getppid(),
+             (intmax_t)expected_parent_pid, comm_sock_fd);
+}
+
+#ifdef __linux__
+static boolean ReadProcStartTime(pid_t pid, unsigned long long *start_ticks)
+{
+    char stat_path[64];
+    if (snprintf(stat_path, sizeof stat_path, "/proc/%jd/stat", (intmax_t)pid)
+        >= (int)sizeof stat_path) {
+        return false;
+    }
+
+    FILE *stat_file = fopen(stat_path, "r");
+    if (!stat_file)
+        return false;
+
+    char buf[1024];
+    if (!fgets(buf, sizeof buf, stat_file)) {
+        fclose(stat_file);
+        return false;
+    }
+    fclose(stat_file);
+
+    char *after_comm = strrchr(buf, ')');
+    if (!after_comm)
+        return false;
+    if (after_comm[1] == '\0')
+        return false;
+
+    char *saveptr = NULL;
+    int token_i = 0;
+    char *tok = strtok_r(after_comm + 2, " ", &saveptr);
+    while (tok) {
+        ++token_i;
+        // Field 22 (starttime) is token 20 after "comm)".
+        if (token_i == 20) {
+            char *end = NULL;
+            errno = 0;
+            unsigned long long v = strtoull(tok, &end, 10);
+            if (errno != 0 || end == tok)
+                return false;
+            *start_ticks = v;
+            return true;
+        }
+        tok = strtok_r(NULL, " ", &saveptr);
+    }
+
+    return false;
+}
+
+static boolean IsSystemdParent(pid_t pid)
+{
+    if (pid <= 1)
+        return false;
+
+    char comm_path[64];
+    if (snprintf(comm_path, sizeof comm_path, "/proc/%jd/comm", (intmax_t)pid)
+        >= (int)sizeof comm_path) {
+        return false;
+    }
+
+    FILE *comm_file = fopen(comm_path, "r");
+    if (!comm_file)
+        return false;
+
+    char comm[64];
+    boolean is_systemd = false;
+    if (fgets(comm, sizeof comm, comm_file) != NULL) {
+        size_t comm_len = strlen(comm);
+        if (comm_len > 0 && comm[comm_len - 1] == '\n')
+            comm[comm_len - 1] = '\0';
+        is_systemd = strcmp(comm, "systemd") == 0;
+    }
+    fclose(comm_file);
+    return is_systemd;
+}
+#endif
+
+static void ChildLog_MaybeExpectedParentStatus(void)
+{
+    if (expected_parent_pid <= 0 || !child_log_file)
+        return;
+
+    int alive = -1;
+    if (kill(expected_parent_pid, 0) == 0) {
+        alive = 1;
+    } else if (errno == EPERM) {
+        alive = 1;
+    } else if (errno == ESRCH) {
+        alive = 0;
+    }
+
+    int same_instance = -1;
+    if (alive == 1) {
+        same_instance = 1;
+#ifdef __linux__
+        if (expected_parent_start_ticks != 0) {
+            unsigned long long current_ticks = 0;
+            if (ReadProcStartTime(expected_parent_pid, &current_ticks))
+                same_instance = current_ticks == expected_parent_start_ticks;
+            else
+                same_instance = -1;
+        }
+#endif
+    }
+
+    if (alive != child_log_last_expected_parent_alive
+        || same_instance != child_log_last_expected_parent_same_instance) {
+        ChildLog(
+            "PARENT_STATUS expected_parent=%jd alive=%s same_instance=%s ppid=%jd comm_sock_fd=%d",
+            (intmax_t)expected_parent_pid,
+            alive == 1 ? "true" : (alive == 0 ? "false" : "unknown"),
+            same_instance == 1
+                ? "true"
+                : (same_instance == 0 ? "false" : "unknown"),
+            (intmax_t)getppid(), comm_sock_fd);
+        child_log_last_expected_parent_alive = alive;
+        child_log_last_expected_parent_same_instance = same_instance;
+    }
+
+    // If the expected PID is alive but no longer the original process, this is
+    // effectively orphaning from the original parent.
+    if (same_instance == 0 && !expected_parent_reuse_logged) {
+        ChildLog(
+            "ORPHAN_DETECTED old_ppid=%jd new_ppid=%jd expected_parent=%jd comm_sock_fd=%d reason=expected_parent_pid_reused",
+            (intmax_t)getppid(), (intmax_t)getppid(),
+            (intmax_t)expected_parent_pid, comm_sock_fd);
+        expected_parent_reuse_logged = true;
+    } else if (same_instance != 0) {
+        expected_parent_reuse_logged = false;
+    }
+}
+
+static void ChildLog_MaybeOrphanTransition(void)
+{
+    pid_t ppid = getppid();
+    if (child_log_last_ppid == 0) {
+        child_log_last_ppid = ppid;
+        return;
+    }
+    if (ppid == child_log_last_ppid)
+        return;
+
+    boolean reparented_to_init_or_systemd = ppid == 1;
+#ifdef __linux__
+    reparented_to_init_or_systemd =
+        reparented_to_init_or_systemd || IsSystemdParent(ppid);
+#endif
+
+    ChildLog(
+        "ORPHAN_DETECTED old_ppid=%jd new_ppid=%jd expected_parent=%jd comm_sock_fd=%d reparented_init_or_systemd=%s",
+        (intmax_t)child_log_last_ppid, (intmax_t)ppid,
+        (intmax_t)expected_parent_pid, comm_sock_fd,
+        reparented_to_init_or_systemd ? "true" : "false");
+    child_log_last_ppid = ppid;
+}
+
 static void ChildLog_MaybeHeartbeat(void)
 {
     if (!child_log_file)
         return;
+
+    ChildLog_MaybeSigterm();
+    ChildLog_MaybeExpectedParentStatus();
+    ChildLog_MaybeOrphanTransition();
 
     time_t now = time(NULL);
     if (child_log_last_heartbeat != 0 && now - child_log_last_heartbeat < 2)
         return;
     child_log_last_heartbeat = now;
 
-    ChildLog("heartbeat ppid=%jd comm_sock_fd=%d gamestate=%d",
-             (intmax_t)getppid(), comm_sock_fd, (int)gamestate);
+    ChildLog("heartbeat ppid=%jd expected_parent=%jd comm_sock_fd=%d gamestate=%d",
+             (intmax_t)getppid(), (intmax_t)expected_parent_pid, comm_sock_fd,
+             (int)gamestate);
+}
+
+static void QuitWithLog(const char *reason)
+{
+    ChildLog("QUIT_REQUEST reason=%s ppid=%jd expected_parent=%jd comm_sock_fd=%d interrupted=%d",
+             reason, (intmax_t)getppid(), (intmax_t)expected_parent_pid,
+             comm_sock_fd, (int)interrupted);
+    I_Quit();
 }
 
 static boolean Ring_IsEmpty(const ringbuf_t *r)
@@ -360,7 +549,7 @@ static void Comm_FlushSend(boolean closing)
             switch (errno) {
             case EINTR:
                 if (interrupted)
-                    I_Quit();
+                    QuitWithLog("send_eintr_interrupted");
                 break;
 
             case ECONNRESET:
@@ -369,9 +558,11 @@ static void Comm_FlushSend(boolean closing)
                         LOG_PRE "Communications connection was closed; "
                                 "quitting: %s\n",
                         strerror(errno));
-                ChildLog("send failed (connection closed): errno=%d (%s)",
-                         errno, strerror(errno));
-                I_Quit(); // noreturn
+                ChildLog(
+                    "SOCKET_SEND_CLOSED errno=%d (%s) ppid=%jd expected_parent=%jd comm_sock_fd=%d",
+                    errno, strerror(errno), (intmax_t)getppid(),
+                    (intmax_t)expected_parent_pid, comm_sock_fd);
+                QuitWithLog("socket_send_closed"); // noreturn
                 abort();
 
             default:
@@ -450,7 +641,7 @@ static void Comm_WriteString(const char *s)
                 LOG_PRE "String of length %zu byte(s) too large for sending; "
                         "quitting\n",
                 len);
-        I_Quit();
+        QuitWithLog("comm_write_string_too_large");
     }
 
     Comm_Write16(len);
@@ -644,7 +835,7 @@ static void Comm_HandleReceivedMsgs(void)
                     LOG_PRE "Received unknown message type %" PRIu8
                             "; quitting\n",
                     state.msg_type);
-            I_Quit();
+            QuitWithLog("unknown_client_msg_type");
         }
 
         // Finished previous message; prepare for a new one.
@@ -687,8 +878,11 @@ static void Comm_Receive(void)
             fprintf(stderr,
                     LOG_PRE "EOF while reading from communications socket; "
                             "quitting\n");
-            ChildLog("recv EOF on communications socket");
-            I_Quit();
+            ChildLog(
+                "SOCKET_RECV_EOF ppid=%jd expected_parent=%jd comm_sock_fd=%d",
+                (intmax_t)getppid(), (intmax_t)expected_parent_pid,
+                comm_sock_fd);
+            QuitWithLog("socket_recv_eof");
         } else if (recv_ret < 0) {
             switch (errno) {
 #if EAGAIN != EWOULDBLOCK
@@ -699,11 +893,14 @@ static void Comm_Receive(void)
 
             case EINTR:
                 if (interrupted)
-                    I_Quit();
+                    QuitWithLog("recv_eintr_interrupted");
                 continue;
             }
 
-            ChildLog("recv failed: errno=%d (%s)", errno, strerror(errno));
+            ChildLog(
+                "SOCKET_RECV_ERR errno=%d (%s) ppid=%jd expected_parent=%jd comm_sock_fd=%d",
+                errno, strerror(errno), (intmax_t)getppid(),
+                (intmax_t)expected_parent_pid, comm_sock_fd);
             I_Error(LOG_PRE "Unexpected error while reading from "
                             "communications socket: %s",
                     strerror(errno));
@@ -718,7 +915,7 @@ static void Comm_Receive(void)
         } else if (Ring_IsFull(&comm_recv_buf)) {
             fprintf(stderr, LOG_PRE "Communications read buffer overflow; "
                                     "quitting\n");
-            I_Quit();
+            QuitWithLog("comm_read_buffer_overflow");
         }
     }
 }
@@ -736,9 +933,18 @@ int main(int argc, char **argv)
     ChildLog("main entered (argc=%d)", argc);
 
     struct sigaction sa = {.sa_handler = SigintHandler};
-    if (sigemptyset(&sa.sa_mask) == -1 || sigaction(SIGINT, &sa, NULL) == -1) {
+    if (sigemptyset(&sa.sa_mask) == -1) {
+        fprintf(stderr,
+                LOG_PRE "Warning: Failed to initialize signal handler mask: %s\n",
+                strerror(errno));
+    } else if (sigaction(SIGINT, &sa, NULL) == -1) {
         fprintf(stderr,
                 LOG_PRE "Warning: Failed to install SIGINT handler: %s\n",
+                strerror(errno));
+    }
+    if (sigaction(SIGTERM, &sa, NULL) == -1) {
+        fprintf(stderr,
+                LOG_PRE "Warning: Failed to install SIGTERM handler: %s\n",
                 strerror(errno));
     }
 
@@ -820,8 +1026,12 @@ static void Cleanup(void)
     CloseListenSocket();
 
     if (comm_sock_fd >= 0) {
-        if (!comm_writing_msg)
+        if (!comm_writing_msg) {
+            ChildLog("AMSG_QUIT_SENT ppid=%jd expected_parent=%jd comm_sock_fd=%d",
+                     (intmax_t)getppid(), (intmax_t)expected_parent_pid,
+                     comm_sock_fd);
             COMM_WRITE_MSG(Comm_Write8(AMSG_QUIT));
+        }
 
         Comm_FlushSend(true);
         if (close(comm_sock_fd) == -1) {
@@ -971,7 +1181,7 @@ void DG_Init(void)
 
         case EINTR:
             if (interrupted)
-                I_Quit();
+                QuitWithLog("accept_eintr_interrupted");
             break;
 
         default:
@@ -992,8 +1202,18 @@ void DG_Init(void)
     if (getsockopt(comm_sock_fd, SOL_SOCKET, SO_PEERCRED, &creds,
                    &(socklen_t){sizeof creds})
         == 0) {
+        expected_parent_pid = creds.pid;
+#ifdef __linux__
+        if (!ReadProcStartTime(expected_parent_pid, &expected_parent_start_ticks))
+            expected_parent_start_ticks = 0;
+#endif
         printf(LOG_PRE "PID %jd has connected\n", (intmax_t)creds.pid);
-        ChildLog("client connected: peer pid=%jd", (intmax_t)creds.pid);
+        ChildLog("client connected: peer pid=%jd expected_parent=%jd",
+                 (intmax_t)creds.pid, (intmax_t)expected_parent_pid);
+        ChildLog("PARENT_STATUS expected_parent=%jd alive=unknown same_instance=%s ppid=%jd comm_sock_fd=%d",
+                 (intmax_t)expected_parent_pid,
+                 expected_parent_start_ticks != 0 ? "true" : "unknown",
+                 (intmax_t)getppid(), comm_sock_fd);
     } else {
         printf(LOG_PRE "A client has connected\n");
         ChildLog("client connected: peer pid unknown (getsockopt failed)");
@@ -1004,8 +1224,10 @@ void DG_Init(void)
     if (getsockopt(comm_sock_fd, SOL_LOCAL, LOCAL_PEERPID, &peer_pid,
                    &peer_pid_len)
         == 0) {
+        expected_parent_pid = peer_pid;
         printf(LOG_PRE "PID %jd has connected\n", (intmax_t)peer_pid);
-        ChildLog("client connected: peer pid=%jd", (intmax_t)peer_pid);
+        ChildLog("client connected: peer pid=%jd expected_parent=%jd",
+                 (intmax_t)peer_pid, (intmax_t)expected_parent_pid);
     } else {
         printf(LOG_PRE "A client has connected\n");
         ChildLog("client connected: peer pid unknown (getsockopt failed)");
@@ -1126,7 +1348,7 @@ void DG_DrawFrame(void)
     while (ftruncate(frame_shm_fd, DOOMGENERIC_SCREEN_BUF_SIZE) == -1) {
         if (errno == EINTR) {
             if (interrupted)
-                I_Quit();
+                QuitWithLog("ftruncate_eintr_interrupted");
             continue;
         }
         I_Error(LOG_PRE "Failed to set size of frame data shared memory: %s",
@@ -1355,7 +1577,7 @@ void DG_SleepMs(uint32_t ms)
     while (nanosleep(&duration, &duration) == -1) {
         if (errno == EINTR) {
             if (interrupted)
-                I_Quit();
+                QuitWithLog("nanosleep_eintr_interrupted");
             // Could consider clock_nanosleep instead to avoid time drift from
             // repeated signal interrupts, but don't care.
             continue;
