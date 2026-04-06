@@ -69,6 +69,7 @@ local M = {
 --- @field play_opts PlayOpts
 --- @field console Console
 --- @field process vim.SystemObj
+--- @field process_exe_basename string?
 --- @field sock uv.uv_pipe_t
 --- @field send_buf StrBuf
 --- @field check_timer uv.uv_timer_t
@@ -87,6 +88,8 @@ local M = {
 --- @field run function
 local Doom = {}
 
+local is_linux = uv.os_uname().sysname == "Linux"
+
 --- @param buf StrBuf
 --- @param s string
 --- @return StrBuf
@@ -97,6 +100,168 @@ local function put_string(buf, s)
     string.char(bit.rshift(#s, 8)),
     s
   )
+end
+
+--- @param path string
+--- @return string?
+local function read_file(path)
+  local f = io.open(path, "r")
+  if not f then
+    return nil
+  end
+  local data = f:read "*a"
+  f:close()
+  return data
+end
+
+--- @param pid integer
+--- @return table?
+local function read_proc_identity(pid)
+  if not is_linux then
+    return nil
+  end
+  local stat = read_file(("/proc/%d/stat"):format(pid))
+  if not stat then
+    return nil
+  end
+  local tail = stat:match("^%d+ %b() (.+)$")
+  if not tail then
+    return nil
+  end
+
+  local tokens = {}
+  for token in tail:gmatch("%S+") do
+    tokens[#tokens + 1] = token
+  end
+  if #tokens < 20 then
+    return nil
+  end
+
+  local cmdline = read_file(("/proc/%d/cmdline"):format(pid))
+  if cmdline then
+    cmdline = cmdline:gsub("%z+", " "):gsub("%s+$", "")
+    if cmdline == "" then
+      cmdline = nil
+    end
+  end
+  local comm = read_file(("/proc/%d/comm"):format(pid))
+  if comm then
+    comm = comm:gsub("%s+$", "")
+    if comm == "" then
+      comm = nil
+    end
+  end
+  local exe_path = uv.fs_readlink(("/proc/%d/exe"):format(pid))
+  local exe_name = exe_path and fs.basename(exe_path) or nil
+
+  return {
+    pid = pid,
+    state = tokens[1],
+    ppid = tonumber(tokens[2]),
+    start_ticks = tonumber(tokens[20]),
+    cmdline = cmdline,
+    comm = comm,
+    exe_path = exe_path,
+    exe_name = exe_name,
+  }
+end
+
+--- @param tag string
+--- @param pid integer
+local function log_proc_identity(tag, pid)
+  local ident = read_proc_identity(pid)
+  if not ident then
+    logger.log("process", ("PROC_IDENTITY tag=%s pid=%d unavailable=true"):format(tag, pid))
+    return
+  end
+  local cmdline = ident.cmdline and ident.cmdline:sub(1, 300) or "nil"
+  logger.log(
+    "process",
+    (
+      "PROC_IDENTITY tag=%s pid=%d state=%s ppid=%s start_ticks=%s comm=%q exe=%q cmdline=%q"
+    ):format(
+      tag,
+      pid,
+      tostring(ident.state),
+      tostring(ident.ppid),
+      tostring(ident.start_ticks),
+      ident.comm or "nil",
+      ident.exe_path or "nil",
+      cmdline
+    )
+  )
+end
+
+--- @param tag string
+--- @param tracked_pid integer?
+--- @param exe_basename string?
+local function log_doom_proc_scan(tag, tracked_pid, exe_basename)
+  if not is_linux then
+    return
+  end
+
+  local scan = uv.fs_scandir "/proc"
+  if not scan then
+    logger.log("process", ("PROC_SCAN tag=%s unavailable=true reason=scandir_failed"):format(tag))
+    return
+  end
+
+  local matches = {}
+  while true do
+    local name = uv.fs_scandir_next(scan)
+    if not name then
+      break
+    end
+    local pid = tonumber(name)
+    if pid then
+      local ident = read_proc_identity(pid)
+      if ident then
+        local cmdline = ident.cmdline
+        local cmd_has_listen = cmdline and cmdline:find("%s%-listen%s", 1, false) ~= nil
+          or false
+        local is_doom_exe = exe_basename
+            and (ident.exe_name == exe_basename or ident.comm == exe_basename)
+          or false
+        if is_doom_exe then
+          ident.cmd_has_listen = cmd_has_listen
+          matches[#matches + 1] = ident
+        end
+      end
+    end
+  end
+
+  table.sort(matches, function(a, b)
+    return a.pid < b.pid
+  end)
+
+  logger.log(
+    "process",
+    ("PROC_SCAN tag=%s tracked_pid=%s exe=%s matches=%d"):format(
+      tag,
+      tracked_pid and tostring(tracked_pid) or "nil",
+      exe_basename or "nil",
+      #matches
+    )
+  )
+  for _, ident in ipairs(matches) do
+    logger.log(
+      "process",
+      (
+        "PROC_SCAN_MATCH tag=%s pid=%d tracked=%s listen=%s state=%s ppid=%s start_ticks=%s comm=%q exe=%q cmdline=%q"
+      ):format(
+        tag,
+        ident.pid,
+        tracked_pid and ident.pid == tracked_pid and "true" or "false",
+        ident.cmd_has_listen and "true" or "false",
+        tostring(ident.state),
+        tostring(ident.ppid),
+        tostring(ident.start_ticks),
+        ident.comm or "nil",
+        ident.exe_path or "nil",
+        ident.cmdline and ident.cmdline:sub(1, 300) or "nil"
+      )
+    )
+  end
 end
 
 function Doom:send_frame_request()
@@ -462,6 +627,9 @@ end
 --- @param exe_path string
 --- @param sock_path string
 local function init_process(doom, exe_path, sock_path)
+  local exe_basename = fs.basename(exe_path)
+  doom.process_exe_basename = exe_basename
+
   --- @param tag string
   --- @param pid integer
   local function log_pid_state(tag, pid)
@@ -477,6 +645,8 @@ local function init_process(doom, exe_path, sock_path)
         tostring(pid_err_msg)
       )
     )
+    log_proc_identity(tag, pid)
+    log_doom_proc_scan(tag, pid, exe_basename)
   end
 
   --- @param console_hl string?
@@ -538,6 +708,8 @@ local function init_process(doom, exe_path, sock_path)
   end
   doom.process = sys_rv
   logger.log("process", ("spawned DOOM pid=%d"):format(sys_rv.pid))
+  log_proc_identity("spawned", sys_rv.pid)
+  log_doom_proc_scan("spawned", sys_rv.pid, exe_basename)
 
   doom.console:plugin_print(
     ("DOOM started as PID %d\n"):format(sys_rv.pid)
@@ -1115,27 +1287,102 @@ function Doom:close(reason)
     self.sock:close() -- Also closes pending requests and such.
   end
   if self.process then
-    logger.log("game", ("Sending SIGTERM to pid=%d"):format(self.process.pid))
-    local ok, kill_err = pcall(self.process.kill, self.process, "sigterm")
-    if ok then
-      local msg = ("PARENT_KILL_RESULT ok pid=%d signal=sigterm"):format(self.process.pid)
+    local pre_ident = read_proc_identity(self.process.pid)
+    if pre_ident then
+      local cmdline = pre_ident.cmdline and pre_ident.cmdline:sub(1, 300) or "nil"
+      logger.log(
+        "process",
+        (
+          "PROC_IDENTITY tag=close_pre_kill pid=%d state=%s ppid=%s start_ticks=%s comm=%q exe=%q cmdline=%q"
+        ):format(
+          self.process.pid,
+          tostring(pre_ident.state),
+          tostring(pre_ident.ppid),
+          tostring(pre_ident.start_ticks),
+          pre_ident.comm or "nil",
+          pre_ident.exe_path or "nil",
+          cmdline
+        )
+      )
+    else
+      logger.log(
+        "process",
+        ("PROC_IDENTITY tag=close_pre_kill pid=%d unavailable=true"):format(self.process.pid)
+      )
+    end
+    log_doom_proc_scan("close_pre_kill", self.process.pid, self.process_exe_basename)
+    local kill_ident = read_proc_identity(self.process.pid)
+    if kill_ident then
+      local cmdline = kill_ident.cmdline and kill_ident.cmdline:sub(1, 300) or "nil"
+      logger.log(
+        "process",
+        (
+          "PROC_IDENTITY tag=close_pre_kill_final pid=%d state=%s ppid=%s start_ticks=%s comm=%q exe=%q cmdline=%q"
+        ):format(
+          self.process.pid,
+          tostring(kill_ident.state),
+          tostring(kill_ident.ppid),
+          tostring(kill_ident.start_ticks),
+          kill_ident.comm or "nil",
+          kill_ident.exe_path or "nil",
+          cmdline
+        )
+      )
+    else
+      logger.log(
+        "process",
+        ("PROC_IDENTITY tag=close_pre_kill_final pid=%d unavailable=true"):format(self.process.pid)
+      )
+    end
+
+    if (kill_ident and kill_ident.state == "Z") or (not kill_ident) then
+      local msg = ("PARENT_KILL_SKIPPED pid=%d reason=already_zombie"):format(self.process.pid)
+      if not kill_ident then
+        msg = ("PARENT_KILL_SKIPPED pid=%d reason=already_gone"):format(self.process.pid)
+      end
       logger.log("game", msg)
       if self.console then
         self.console:plugin_print(msg .. "\n", "Debug")
       end
     else
-      local err_msg = tostring(kill_err)
-      local reason = err_msg:match("(%u%u%u%u%u)") or "UNKNOWN"
-      local msg = ("PARENT_KILL_RESULT fail pid=%d signal=sigterm reason=%s err=%s"):format(
-        self.process.pid,
-        reason,
-        err_msg
-      )
-      logger.log("game", msg)
-      if self.console then
-        self.console:plugin_print(msg .. "\n", "Error")
+      logger.log("game", ("Sending SIGTERM to pid=%d"):format(self.process.pid))
+      local ok, kill_err = pcall(self.process.kill, self.process, "sigterm")
+      if ok then
+        local msg = ("PARENT_KILL_RESULT ok pid=%d signal=sigterm"):format(self.process.pid)
+        logger.log("game", msg)
+        if self.console then
+          self.console:plugin_print(msg .. "\n", "Debug")
+        end
+      else
+        local err_msg = tostring(kill_err)
+        local reason = err_msg:match("(%u%u%u%u%u)") or "UNKNOWN"
+        local msg = ("PARENT_KILL_RESULT fail pid=%d signal=sigterm reason=%s err=%s"):format(
+          self.process.pid,
+          reason,
+          err_msg
+        )
+        logger.log("game", msg)
+        if self.console then
+          self.console:plugin_print(msg .. "\n", "Error")
+        end
       end
     end
+    vim.defer_fn(function()
+      log_proc_identity("close_post_kill_plus_100ms", self.process.pid)
+      log_doom_proc_scan(
+        "close_post_kill_plus_100ms",
+        self.process.pid,
+        self.process_exe_basename
+      )
+    end, 100)
+    vim.defer_fn(function()
+      log_proc_identity("close_post_kill_plus_1000ms", self.process.pid)
+      log_doom_proc_scan(
+        "close_post_kill_plus_1000ms",
+        self.process.pid,
+        self.process_exe_basename
+      )
+    end, 1000)
   end
   -- Close console before the screen so it doesn't print the "buffer was
   -- unloaded" message from us closing the screen.
