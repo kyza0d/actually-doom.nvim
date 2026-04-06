@@ -579,11 +579,27 @@ static void Comm_FlushSend(boolean closing)
     comm_send_buf.len = 0;
 }
 
+static boolean Comm_EnsureWriteSpace(size_t needed)
+{
+    if (needed > COMM_SEND_BUF_CAP)
+        return false;
+    if (comm_send_buf.len + needed <= COMM_SEND_BUF_CAP)
+        return true;
+
+    Comm_FlushSend(false);
+    return comm_send_buf.len + needed <= COMM_SEND_BUF_CAP;
+}
+
 static void Comm_Write8(uint8_t v)
 {
     assert(comm_writing_msg);
-    if (comm_send_buf.len + 1 > COMM_SEND_BUF_CAP)
-        Comm_FlushSend(false);
+    if (!Comm_EnsureWriteSpace(1)) {
+        fprintf(stderr,
+                LOG_PRE
+                "Warning: Unable to reserve communications send buffer space "
+                "for 1 byte; dropping write\n");
+        return;
+    }
 
     comm_send_buf.data[comm_send_buf.len++] = v;
 }
@@ -591,8 +607,13 @@ static void Comm_Write8(uint8_t v)
 static void Comm_Write16(uint16_t v)
 {
     assert(comm_writing_msg);
-    if (comm_send_buf.len + 2 > COMM_SEND_BUF_CAP)
-        Comm_FlushSend(false);
+    if (!Comm_EnsureWriteSpace(2)) {
+        fprintf(stderr,
+                LOG_PRE
+                "Warning: Unable to reserve communications send buffer space "
+                "for 2 bytes; dropping write\n");
+        return;
+    }
 
     comm_send_buf.data[comm_send_buf.len++] = v & 0xff;
     comm_send_buf.data[comm_send_buf.len++] = (v >> 8) & 0xff;
@@ -601,8 +622,13 @@ static void Comm_Write16(uint16_t v)
 static void Comm_Write32(uint32_t v)
 {
     assert(comm_writing_msg);
-    if (comm_send_buf.len + 4 > COMM_SEND_BUF_CAP)
-        Comm_FlushSend(false);
+    if (!Comm_EnsureWriteSpace(4)) {
+        fprintf(stderr,
+                LOG_PRE
+                "Warning: Unable to reserve communications send buffer space "
+                "for 4 bytes; dropping write\n");
+        return;
+    }
 
     comm_send_buf.data[comm_send_buf.len++] = v & 0xff;
     comm_send_buf.data[comm_send_buf.len++] = (v >> 8) & 0xff;
@@ -614,7 +640,16 @@ static void Comm_WriteBytes(const byte *p, size_t len)
 {
     assert(comm_writing_msg);
 
-    while (true) {
+    while (len > 0) {
+        if (!Comm_EnsureWriteSpace(1)) {
+            fprintf(stderr,
+                    LOG_PRE
+                    "Warning: Unable to reserve communications send buffer "
+                    "space while writing %zu bytes; dropping remainder\n",
+                    len);
+            return;
+        }
+
         size_t free_len = COMM_SEND_BUF_CAP - comm_send_buf.len;
         size_t copy_len = len <= free_len ? len : free_len;
 
@@ -622,12 +657,6 @@ static void Comm_WriteBytes(const byte *p, size_t len)
         comm_send_buf.len += copy_len;
         len -= copy_len;
         p += copy_len;
-
-        if (len == 0)
-            break;
-
-        // If we got here, then the buffer's full.
-        Comm_FlushSend(false);
     }
 }
 
