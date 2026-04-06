@@ -71,7 +71,9 @@ local M = {
 --- @field sock uv.uv_pipe_t
 --- @field send_buf StrBuf
 --- @field check_timer uv.uv_timer_t
+--- @field tmux_check_timer uv.uv_timer_t
 --- @field check_scheduled boolean?
+--- @field tmux_status_check_running boolean?
 --- @field pressed_key PressedKey?
 --- @field mouse_button_mask integer
 --- @field screen Screen?
@@ -177,6 +179,47 @@ function Doom:schedule_check(ms)
     assert(self.check_timer:start(ms, 0, self:close_on_err_wrap(check_cb)))
     self.check_scheduled = true
   end
+end
+
+--- @param doom Doom
+local function check_tmux_client_state(doom)
+  if doom.tmux_status_check_running or doom.closed then
+    return
+  end
+
+  local tmux = os.getenv "TMUX"
+  local tmux_pane = os.getenv "TMUX_PANE"
+  if not tmux or tmux == "" or not tmux_pane or tmux_pane == "" then
+    return
+  end
+
+  doom.tmux_status_check_running = true
+  vim.system({
+    "tmux",
+    "display-message",
+    "-p",
+    "-t",
+    tmux_pane,
+    "#{session_attached} #{window_active_clients}",
+  }, { text = true }, function(out)
+    doom.tmux_status_check_running = false
+    if doom.closed then
+      return
+    end
+
+    if out.code ~= 0 then
+      return
+    end
+
+    local attached, active_clients = out.stdout:match("(%d+)%s+(%d+)")
+    if tonumber(attached) == 0 and tonumber(active_clients) == 0 then
+      vim.schedule(function()
+        if not doom.closed then
+          doom:close "tmux detached"
+        end
+      end)
+    end
+  end)
 end
 
 --- @param dkey integer
@@ -966,6 +1009,7 @@ function Doom.run(console, exe_path, opts)
     console = console,
     play_opts = opts,
     check_timer = assert(uv.new_timer()),
+    tmux_check_timer = assert(uv.new_timer()),
     send_buf = strbuf.new(256),
     mouse_button_mask = 0,
     game_msg = "",
@@ -994,6 +1038,9 @@ function Doom.run(console, exe_path, opts)
     doom.console:set_doom(doom)
     init_connection(doom, sock_path)
   end)
+  assert(doom.tmux_check_timer:start(2000, 2000, function()
+    check_tmux_client_state(doom)
+  end))
 
   return doom
 end
@@ -1008,6 +1055,10 @@ function Doom:close()
   if self.check_timer then
     self.check_timer:stop()
     self.check_timer:close()
+  end
+  if self.tmux_check_timer then
+    self.tmux_check_timer:stop()
+    self.tmux_check_timer:close()
   end
   if self.sock then
     self.sock:close() -- Also closes pending requests and such.
